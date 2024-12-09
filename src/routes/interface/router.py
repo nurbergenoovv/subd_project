@@ -138,21 +138,17 @@ async def get_dashboard(
 
     worker: UserOut = await auth.get_current_user(db, worker_token)
 
-    # Fetch category
     category_stmt = await db.execute(select(Category).where(Category.id == worker.category_id))
     category = category_stmt.scalars().first()
     if not category:
         raise HTTPException(status_code=404, detail="Category not found")
 
-    # Timezone and date setup
     tz = pytz.timezone('Asia/Almaty')
     today = datetime.now(tz).date()
 
-    # Debugging Logs
     print(
         f"Worker ID: {worker.id}, Category ID: {worker.category_id}, Today's Date: {today}")
 
-    # Accepted Today
     accepted_today_result = await db.execute(
         select(func.count(Ticket.id)).where(
             Ticket.worker_id == worker.id,
@@ -163,7 +159,6 @@ async def get_dashboard(
     accepted_today = accepted_today_result.scalar()
     print(f"Accepted Today: {accepted_today}")
 
-    # Skipped Today
     skipped_today_result = await db.execute(
         select(func.count(Ticket.id)).where(
             Ticket.worker_id == worker.id,
@@ -174,7 +169,6 @@ async def get_dashboard(
     skipped_today = skipped_today_result.scalar()
     print(f"Skipped Today: {skipped_today}")
 
-    # Served Today
     served_today_result = await db.execute(
         select(func.count(Ticket.id)).where(
             Ticket.worker_id == worker.id,
@@ -185,7 +179,6 @@ async def get_dashboard(
     served_today = served_today_result.scalar()
     print(f"Served Today: {served_today}")
 
-    # Personal Data
     personal_data = Personal_data(
         user=worker,
         accepted_today=accepted_today,
@@ -229,7 +222,6 @@ async def get_dashboard(
         served_today=served_today_general
     )
 
-    # Current Ticket
     current_ticket_stmt = await db.execute(
         select(Ticket).where(
             Ticket.worker_id == worker.id,
@@ -271,7 +263,6 @@ async def get_interface_admin(
     tz = pytz.timezone('Asia/Almaty')
     today = datetime.now(tz).date()
     try:
-        # Validate token and fetch admin user
         user = await auth.get_current_user(db, request.token)
 
         if not user:
@@ -310,7 +301,6 @@ async def get_interface_admin(
             served_today=served_today
         )
 
-        # Fetch categories and their users
         categories_result = await db.execute(select(Category))
         categories = categories_result.scalars().all()
 
@@ -422,51 +412,68 @@ async def get_interface_statistics(db: AsyncSession = Depends(get_async_session)
     tz = pytz.timezone('Asia/Almaty')
     today = datetime.now(tz).date()
 
-    accepted_today_result = await db.execute(
-        select(func.count(Ticket.id)).where(
-            Ticket.status.in_(["invited", "completed", "skipped"]),
+    general_query = await db.execute(
+        select(
+            Ticket.status,
+            func.count(Ticket.id).label("count")
+        ).where(
             func.date(Ticket.created_at) == today
-        )
+        ).group_by(Ticket.status)
     )
-    accepted_today = accepted_today_result.scalar()
+    general_results = general_query.fetchall()
 
-    cancelled_today_result = await db.execute(
-        select(func.count(Ticket.id)).where(
-            Ticket.status == "cancelled",
+    stats_mapping = {row.status: row.count for row in general_results}
+    accepted_today = sum(
+        stats_mapping.get(status, 0) for status in ["invited", "completed", "skipped"]
+    )
+    cancelled_today = stats_mapping.get("cancelled", 0)
+    passed_today = stats_mapping.get("skipped", 0)
+    serviced_today = stats_mapping.get("completed", 0)
+
+    all_time_query = await db.execute(
+        select(
+            Ticket.status,
+            func.count(Ticket.id).label("count")
+        ).group_by(Ticket.status)
+    )
+    all_time_results = all_time_query.fetchall()
+
+    all_time_mapping = {row.status: row.count for row in all_time_results}
+    serviced_all_time = all_time_mapping.get("completed", 0)
+    accepted_all_time = sum(
+        all_time_mapping.get(status, 0) for status in ["invited", "completed", "skipped"]
+    )
+
+    category_query = await db.execute(
+        select(
+            Category.id,
+            Category.name,
+            Ticket.status,
+            func.count(Ticket.id).label("count")
+        ).join(Ticket, Ticket.category_id == Category.id).where(
             func.date(Ticket.created_at) == today
-        )
+        ).group_by(Category.id, Ticket.status)
     )
-    cancelled_today = cancelled_today_result.scalar()
+    category_results = category_query.fetchall()
 
-    passed_today_result = await db.execute(
-        select(func.count(Ticket.id)).where(
-            Ticket.status == "skipped",
-            func.date(Ticket.created_at) == today
-        )
-    )
-    passed_today = passed_today_result.scalar()
+    categories = {}
+    for row in category_results:
+        category = categories.setdefault(row.id, {"name": row.name, "stats": {}})
+        category["stats"][row.status] = row.count
 
-    serviced_today_result = await db.execute(
-        select(func.count(Ticket.id)).where(
-            Ticket.status == "completed",
-            func.date(Ticket.created_at) == today
+    category_stats = []
+    for category_id, data in categories.items():
+        stats = data["stats"]
+        category_stat = Statistic(
+            category_name=data["name"],
+            accepted_today=sum(stats.get(status, 0) for status in ["invited", "completed", "skipped"]),
+            cancelled_today=stats.get("cancelled", 0),
+            passed_today=stats.get("skipped", 0),
+            serviced_today=stats.get("completed", 0),
+            serviced_all_time=0,
+            accepted_all_time=0
         )
-    )
-    serviced_today = serviced_today_result.scalar()
-
-    serviced_all_time_result = await db.execute(
-        select(func.count(Ticket.id)).where(
-            Ticket.status == "completed"
-        )
-    )
-    serviced_all_time = serviced_all_time_result.scalar()
-
-    accepted_all_time_result = await db.execute(
-        select(func.count(Ticket.id)).where(
-            Ticket.status.in_(["invited", "completed", "skipped"])
-        )
-    )
-    accepted_all_time = accepted_all_time_result.scalar()
+        category_stats.append(category_stat)
 
     general_stat = Statistic(
         category_name="General",
@@ -478,74 +485,6 @@ async def get_interface_statistics(db: AsyncSession = Depends(get_async_session)
         accepted_all_time=accepted_all_time
     )
 
-    categories_result = await db.execute(select(Category))
-    categories = categories_result.scalars().all()
-
-    category_stats = []
-    for category in categories:
-        accepted_today_category_result = await db.execute(
-            select(func.count(Ticket.id)).where(
-                Ticket.category_id == category.id,
-                Ticket.status.in_(["invited", "completed", "skipped"]),
-                func.date(Ticket.created_at) == today
-            )
-        )
-        accepted_today_category = accepted_today_category_result.scalar()
-
-        cancelled_today_category_result = await db.execute(
-            select(func.count(Ticket.id)).where(
-                Ticket.category_id == category.id,
-                Ticket.status == "cancelled",
-                func.date(Ticket.created_at) == today
-            )
-        )
-        cancelled_today_category = cancelled_today_category_result.scalar()
-
-        passed_today_category_result = await db.execute(
-            select(func.count(Ticket.id)).where(
-                Ticket.category_id == category.id,
-                Ticket.status == "skipped",
-                func.date(Ticket.created_at) == today
-            )
-        )
-        passed_today_category = passed_today_category_result.scalar()
-
-        serviced_today_category_result = await db.execute(
-            select(func.count(Ticket.id)).where(
-                Ticket.category_id == category.id,
-                Ticket.status == "completed",
-                func.date(Ticket.created_at) == today
-            )
-        )
-        serviced_today_category = serviced_today_category_result.scalar()
-
-        serviced_all_time_category_result = await db.execute(
-            select(func.count(Ticket.id)).where(
-                Ticket.category_id == category.id,
-                Ticket.status == "completed"
-            )
-        )
-        serviced_all_time_category = serviced_all_time_category_result.scalar()
-
-        accepted_all_time_category_result = await db.execute(
-            select(func.count(Ticket.id)).where(
-                Ticket.category_id == category.id,
-                Ticket.status.in_(["invited", "completed", "skipped"])
-            )
-        )
-        accepted_all_time_category = accepted_all_time_category_result.scalar()
-
-        category_stat = Statistic(
-            category_name=category.name,
-            accepted_today=accepted_today_category,
-            cancelled_today=cancelled_today_category,
-            passed_today=passed_today_category,
-            serviced_today=serviced_today_category,
-            serviced_all_time=serviced_all_time_category,
-            accepted_all_time=accepted_all_time_category
-        )
-        category_stats.append(category_stat)
-
     response = StatisticResponse(
         general_data=general_stat,
         categories=category_stats,
@@ -553,6 +492,7 @@ async def get_interface_statistics(db: AsyncSession = Depends(get_async_session)
     )
 
     return response
+
 
 
 @router.get('/admin/statistics/{worker_id}/{date_filter}/', response_model=List[TicketOut])
@@ -567,7 +507,6 @@ async def get_worker_statistics(
     if not date_filter:
         raise HTTPException(status_code=400, detail="Date filter must be provided")
 
-    # Set the date threshold based on the date_filter
     if date_filter == "1_day":
         date_threshold = now - timedelta(days=1)
     elif date_filter == "1_week":
@@ -577,20 +516,16 @@ async def get_worker_statistics(
     else:
         raise HTTPException(status_code=400, detail="Invalid date filter")
 
-    # Make date_threshold naive (remove timezone info)
     date_threshold = date_threshold.replace(tzinfo=None)
 
-    # Build the query
     query = select(Ticket).where(
         Ticket.created_at >= date_threshold,
         Ticket.worker_id == worker_id
     )
 
-    # Execute the query
     result = await db.execute(query)
     tickets = result.scalars().all()
 
-    # Check if any tickets were found
     if not tickets:
         raise HTTPException(status_code=404, detail="No tickets found for the given worker and date filter")
 
